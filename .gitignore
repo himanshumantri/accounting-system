@@ -18,8 +18,8 @@ frontend/dist/
 .vs/
 !.env.example
 
-# Firebase / deploy helper files (never commit secrets)
-.firebase/
-firebase-debug.log
+# Deploy helper files (never commit secrets)
 neon-url.txt
 token.txt
+sa-key.json
+*-key.json

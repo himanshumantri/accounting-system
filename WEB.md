@@ -1,7 +1,8 @@
 # Open Accounting: web version
 
-`backend/` (FastAPI, runs on Google Cloud Run) and `frontend/` (React + Vite, served by Firebase Hosting)
-replace the Tkinter desktop app. The database is a free Neon Postgres. The desktop files in the repo root are kept for reference and are not used by the web app.
+`backend/` (FastAPI, runs on Google Cloud Run) and `frontend/` (React + Vite, published with GitLab Pages)
+replace the Tkinter desktop app. The database is a free Neon Postgres. GitLab builds, tests and deploys everything;
+Google Cloud only runs the API. The desktop files in the repo root are kept for reference and are not used by the web app.
 
 ## Run locally
 
@@ -22,91 +23,128 @@ npm run dev                               # http://localhost:5173
 Without `DATABASE_URL` the API uses a local SQLite file (`openaccounting.db`, git-ignored). Tables are created
 on start but never altered, so delete any old local `openaccounting.db` after pulling schema changes.
 
-## Deploy (Google Cloud + Neon)
+## Deploy (GitLab + Cloud Run + Neon)
 
-| Piece | Service | Notes |
+| Piece | Where | Notes |
 |---|---|---|
-| Database | Neon (free Postgres) | Outside Google Cloud; Cloud Run connects to it over the internet with SSL. |
-| API | Cloud Run | Container built from `backend/Dockerfile`. Scales to zero, so the first request after idle is slow. |
-| Frontend | Firebase Hosting | Static files from `frontend/dist`. |
-| Recurring entries | Cloud Scheduler | Calls `POST /recurring/run` every night. |
-| Secrets | Secret Manager | Holds `DATABASE_URL` and `RECURRING_RUN_TOKEN`. |
+| Code, tests, builds, deploys | GitLab CI (`.gitlab-ci.yml`) | Tests run on SQLite and on a Postgres service container. |
+| Frontend | GitLab Pages | Free static hosting. Built by the `pages` job. |
+| API | Google Cloud Run | Scales to zero; the first request after idle is slow. |
+| API container image | Google Artifact Registry | Cloud Run can only pull images from Google's registries. A cleanup policy keeps just the last 2. |
+| Database | Neon (free Postgres) | Cloud Run connects over the internet with SSL. |
+| Secrets | Google Secret Manager | `database-url` and `recurring-run-token`. Cloud Run reads them directly; GitLab never sees them. |
+| Other settings | GitLab CI/CD variables | Non-secret values such as the site URL. Passed to Cloud Run at deploy time. |
 
-Replace `PROJECT_ID`, `REGION` (e.g. `asia-south1`) and the other capitalised placeholders below. You need the
-[gcloud CLI](https://cloud.google.com/sdk/docs/install) and a Google Cloud project with billing enabled (the free
-allowances still require a billing account). Check current pricing and free-tier limits before you rely on them.
+Not used, so they cannot add cost: Cloud Build, Cloud Scheduler, Firebase. Only three Google APIs are enabled
+(Cloud Run, Artifact Registry and Secret Manager). Replace `PROJECT_ID`, `REGION` (e.g. `asia-south1`) and the other
+capitalised placeholders. You need the [gcloud CLI](https://cloud.google.com/sdk/docs/install) and a Google Cloud
+project with billing enabled (the free allowances still need a billing account). Check current pricing yourself.
 
 ### 1. Database (Neon)
 Create a project at neon.tech. In **Connect**, turn on **Connection pooling** and copy the connection string; its
 host contains `-pooler` and it ends in `?sslmode=require`. Tables are created automatically on the first start.
 
-### 2. Google Cloud setup and secrets
+### 2. Google Cloud, one time
 ```
 gcloud auth login
 gcloud config set project PROJECT_ID
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
+gcloud artifacts repositories create open-accounting --repository-format=docker --location=REGION
+gcloud artifacts repositories set-cleanup-policies open-accounting --location=REGION --policy=deploy/artifact-registry-cleanup.json --no-dry-run
 ```
-Put the Neon connection string alone in a text file (`neon-url.txt`) and a random token in another
-(`python -c "import secrets; print(secrets.token_urlsafe(32))"` generates one), then:
+(If gcloud rejects a flag on the last command, see `gcloud artifacts repositories set-cleanup-policies --help`.)
+
+Create a service account for GitLab to deploy with:
+```
+gcloud iam service-accounts create gitlab-deployer --display-name "GitLab deployer"
+gcloud projects add-iam-policy-binding PROJECT_ID --member "serviceAccount:gitlab-deployer@PROJECT_ID.iam.gserviceaccount.com" --role roles/run.admin
+gcloud projects add-iam-policy-binding PROJECT_ID --member "serviceAccount:gitlab-deployer@PROJECT_ID.iam.gserviceaccount.com" --role roles/artifactregistry.writer
+gcloud iam service-accounts add-iam-policy-binding PROJECT_NUMBER-compute@developer.gserviceaccount.com --member "serviceAccount:gitlab-deployer@PROJECT_ID.iam.gserviceaccount.com" --role roles/iam.serviceAccountUser
+gcloud iam service-accounts keys create sa-key.json --iam-account gitlab-deployer@PROJECT_ID.iam.gserviceaccount.com
+```
+`gcloud projects describe PROJECT_ID --format="value(projectNumber)"` prints the project number. The key file is a
+password: paste its contents into GitLab in the next step, then delete `sa-key.json` (it is git-ignored, but do not
+leave it around). If your organisation blocks key creation, use Workload Identity Federation with GitLab's OIDC
+tokens instead.
+
+Store the two secrets. Put the Neon connection string alone in a text file (`neon-url.txt`) and a random token in
+another (`token.txt`; `python -c "import secrets; print(secrets.token_urlsafe(32))"` generates one). A trailing
+newline in the files is fine. Then:
 ```
 gcloud secrets create database-url --data-file=neon-url.txt
 gcloud secrets create recurring-run-token --data-file=token.txt
+gcloud secrets add-iam-policy-binding database-url --member "serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" --role roles/secretmanager.secretAccessor
+gcloud secrets add-iam-policy-binding recurring-run-token --member "serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" --role roles/secretmanager.secretAccessor
 ```
-Delete both text files afterwards. Let Cloud Run read the secrets (its default service account is
-`PROJECT_NUMBER-compute@developer.gserviceaccount.com`; `gcloud projects describe PROJECT_ID --format="value(projectNumber)"`
-prints the number):
-```
-gcloud secrets add-iam-policy-binding database-url --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" --role=roles/secretmanager.secretAccessor
-gcloud secrets add-iam-policy-binding recurring-run-token --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" --role=roles/secretmanager.secretAccessor
-```
+Delete both text files afterwards (they are git-ignored). `PROJECT_NUMBER-compute@...` is the identity Cloud Run runs
+as, and it is the one that needs access to the secrets; the GitLab deploy account does not need to read them.
 
-### 3. API on Cloud Run
-```
-gcloud run deploy open-accounting-api --source backend --region REGION --allow-unauthenticated --max-instances 3 --set-secrets "DATABASE_URL=database-url:latest,RECURRING_RUN_TOKEN=recurring-run-token:latest" --set-env-vars "CORS_ORIGINS=https://PROJECT_ID.web.app,APP_TIMEZONE=Asia/Kolkata"
-```
-- Answer **Y** if it offers to create an Artifact Registry repository.
-- `--allow-unauthenticated` is needed because browsers call the API directly. There is no login yet.
-- `CORS_ORIGINS` is the Firebase Hosting URL from step 4 (`https://PROJECT_ID.web.app`). To allow several
-  origins, separate them with commas and use a different list delimiter for the flag, for example
-  `--set-env-vars "^@^CORS_ORIGINS=https://PROJECT_ID.web.app,https://PROJECT_ID.firebaseapp.com@APP_TIMEZONE=Asia/Kolkata"`.
-- `APP_TIMEZONE` sets what "today" means for recurring entries; Cloud Run itself runs in UTC.
-- The command prints the service URL (`https://open-accounting-api-XXXX.REGION.run.app`). Check
-  `curl SERVICE_URL/health` returns `{"status":"ok"}`.
+### 3. GitLab: variables and Pages
+Push this repository to a GitLab project, then add these under **Settings > CI/CD > Variables**:
 
-### 4. Frontend on Firebase Hosting
-Add Firebase to the project once (console.firebase.google.com, "Add project", pick your existing project), then:
-```
-cd frontend
-npm install
-```
-Build with the API URL set (it is baked in at build time):
-- PowerShell: `$env:VITE_API_URL="SERVICE_URL"; npm run build`
-- bash: `VITE_API_URL=SERVICE_URL npm run build`
-```
-npx firebase-tools login
-npx firebase-tools use --add          # choose PROJECT_ID
-npx firebase-tools deploy --only hosting
-```
-It prints the site URL (`https://PROJECT_ID.web.app`). If it differs from what you put in `CORS_ORIGINS`,
-update the Cloud Run variable: `gcloud run services update open-accounting-api --region REGION --update-env-vars ...`.
+| Variable | Type | Value |
+|---|---|---|
+| `GCP_PROJECT_ID` | Variable | your project id |
+| `GCP_REGION` | Variable | the region used above |
+| `GCP_SA_KEY` | **File** | contents of `sa-key.json` |
+| `CORS_ORIGINS` | Variable | the Pages origin (step 4) |
+| `VITE_API_URL` | Variable | the Cloud Run URL (step 4) |
+| `APP_TIMEZONE` | Variable | optional, e.g. `Asia/Kolkata`; what "today" means for recurring entries (default UTC) |
 
-### 5. Recurring entries (Cloud Scheduler)
-```
-gcloud scheduler jobs create http recurring-entries --location REGION --schedule "0 2 * * *" --time-zone "Asia/Kolkata" --uri "SERVICE_URL/recurring/run" --http-method POST --headers "X-Run-Token=YOUR_TOKEN" --attempt-deadline 180s --max-retry-attempts 3
-gcloud scheduler jobs run recurring-entries --location REGION      # test it now
-```
-`YOUR_TOKEN` is the value in `recurring-run-token`
-(`gcloud secrets versions access latest --secret recurring-run-token`).
+The database URL and run token are not GitLab variables; they come from Secret Manager (step 2).
+`GCP_SA_KEY` can be marked protected: protected variables are only available to protected branches, and the default
+branch is protected by default. Turn on Pages for the project if your GitLab plan asks (**Deploy > Pages**).
 
-### Redeploying
-API: rerun the `gcloud run deploy` command (the flags are remembered, so `gcloud run deploy open-accounting-api --source backend --region REGION` is enough).
-Frontend: rebuild, then `npx firebase-tools deploy --only hosting`.
+### 4. First deploy
+The Cloud Run URL and Pages URL are only known after the first run, so deploy twice:
+1. Merge to the default branch (or **Build > Pipelines > Run pipeline**). `deploy-api` and `pages` run; the
+   site may not work yet because `CORS_ORIGINS` and `VITE_API_URL` are still empty.
+2. Get the API URL: `gcloud run services describe open-accounting-api --region REGION --format "value(status.url)"`.
+   Get the site URL from **Deploy > Pages**. Set `VITE_API_URL` to the first and `CORS_ORIGINS` to the origin of the
+   second (scheme and host only, no path, e.g. `https://my-project-1a2b3c.gitlab.io`).
+3. **Run pipeline** again from the default branch (a manual run builds and deploys everything).
+4. Check `API_URL/health` returns `{"status":"ok"}`, then open the Pages site.
 
-### Things to know
+After that, pushes to the default branch redeploy only what changed: `backend/` changes rebuild and redeploy
+the API; `frontend/` changes republish the site. Other changes (docs, tests-only) deploy nothing.
+
+### Keeping the Google Cloud bill minimal
+- Cloud Run is set to scale to zero (`--min-instances 0`), 512 MiB, at most 2 instances, billed per request.
+- Artifact Registry's cleanup policy keeps only the 2 newest images (the first 0.5 GB of storage is free).
+- Set a budget alert (**Billing > Budgets & alerts**) at a small amount. Budgets send email but do not stop spending.
+- Secret Manager's free tier is 6 active secret versions, 10,000 accesses and 3 rotations per month, counted across
+  **all projects on the same billing account**. This app uses 2 versions and about 2 accesses per cold start. If
+  your other projects already use 4 or more versions, each extra one costs about $0.06 a month. Disabled versions
+  count as active; destroyed ones are free. Verify on the [pricing page](https://cloud.google.com/secret-manager/pricing).
+
+### Changing a secret
+```
+gcloud secrets versions add database-url --data-file=neon-url.txt
+gcloud secrets versions list database-url
+gcloud secrets versions destroy OLD_VERSION_NUMBER --secret database-url
+gcloud run services update open-accounting-api --region REGION --update-env-vars SECRETS_ROTATED=2026-10-21
+```
+The last command only forces a new revision (put today's date, a different value each time): Cloud Run reads the `latest` version when an instance starts, so
+running instances keep the old value until replaced. Destroy the old version so it stops counting as active.
+
+### Who can see the secrets
+Cloud Run settings and Secret Manager are per Google Cloud project. Other projects cannot read this project's
+secrets or service settings, and nothing here grants them access. What matters is who has a role in **this**
+project (or on a folder or organisation above it): the `Secret Accessor` role is needed to read a secret's value, and
+Viewer-style roles can see the service configuration but not the secret values. Keep this app in its own project.
+
+### Recurring entries
+Entries post when someone presses **Run due now** on the Recurring tab. To make it automatic, schedule a call
+yourself (for example a GitLab pipeline schedule with its own job; pipelines started by a schedule skip all the
+deploy jobs here): `POST API_URL/recurring/run` with the header `X-Run-Token: <the value of the recurring-run-token
+secret>` (store that value as a masked GitLab variable for your schedule job). It is safe to
+call repeatedly: running twice never double-posts and missed periods are caught up.
+
+### Notes
 - There is no login yet: anyone with the URL can read and change the data. Use test data only until one is added.
 - Cloud Run scales to zero and Neon's free compute pauses when idle, so the first request after a quiet period can
-  take several seconds. The nightly scheduler call retries to cover this.
-- To change the database later, only the `database-url` secret changes (`gcloud secrets versions add database-url --data-file=...`, then redeploy).
+  take several seconds.
+- The CI deploy pipeline has not been run end to end: expect to fix small things on the first deploy.
 
 ## How the books work
 
@@ -120,7 +158,7 @@ Frontend: rebuild, then `npx firebase-tools deploy --only hosting`.
 - Accrual drafts keep their order: a reversal can only be posted after its original, and monthly amortization
   after the prepaid/deferred entry (discarding an entry also discards the drafts that depend on it). Monthly
   amounts are rounded down to the cent with the remainder in the last month.
-- **Recurring entries**: due entries post when you press "Run due now" or when Cloud Scheduler calls
+- **Recurring entries**: due entries post when you press "Run due now" or when something you schedule calls
   `POST /recurring/run`. Running twice never double-posts, and periods missed because nothing ran are caught up.
   Pausing and resuming skips the paused periods. One run posts at most 400 entries per recurring entry (press the
   button again, or let the next scheduled run continue).

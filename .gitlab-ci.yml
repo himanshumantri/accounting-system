@@ -1,12 +1,113 @@
-# Runs the backend tests on every push. Recurring entries are triggered by Cloud Scheduler (see WEB.md),
-# not by a pipeline.
+# GitLab does the building, testing and deploying. Google Cloud only runs the API (Cloud Run).
+#
+#   test            pytest on SQLite, and again on a Postgres service container
+#   build           builds backend/Dockerfile and pushes it to Artifact Registry (Cloud Run needs it there)
+#   deploy          deploys that image to Cloud Run, with settings taken from the CI/CD variables below
+#   pages           builds the React app and publishes it with GitLab Pages
+#
+# Set these under Settings > CI/CD > Variables (see WEB.md for how to get each value):
+#   GCP_PROJECT_ID, GCP_REGION   plain variables
+#   GCP_SA_KEY                   type "File": the deploy service account's JSON key
+#   CORS_ORIGINS                 the Pages site origin, e.g. https://my-project-1a2b3c.gitlab.io
+#   VITE_API_URL                 the Cloud Run service URL (known after the first deploy)
+#   APP_TIMEZONE                 optional, e.g. Asia/Kolkata (default UTC)
+#
+# The two real secrets, DATABASE_URL and RECURRING_RUN_TOKEN, are NOT GitLab variables: they live in Google
+# Secret Manager (secrets "database-url" and "recurring-run-token") and Cloud Run reads them directly.
+#
+# Pipelines started by a schedule skip every job here, so any schedule you add will not rebuild or redeploy.
 
-stages: [test]
+stages: [test, build, deploy]
+
+variables:
+  IMAGE: "$GCP_REGION-docker.pkg.dev/$GCP_PROJECT_ID/open-accounting/api:$CI_COMMIT_SHORT_SHA"
+
+.not-scheduled:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+
+# Deploy jobs run on the default branch only, and only when the relevant folder changed
+# (a manually started pipeline always runs everything).
+.deploy-api-rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: ["backend/**/*"]
+
+.deploy-frontend-rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: ["frontend/**/*"]
 
 backend-tests:
   stage: test
+  extends: .not-scheduled
   image: python:3.11-slim
   script:
     - cd backend
     - pip install -r requirements-dev.txt
     - python -m pytest -q
+
+backend-tests-postgres:
+  stage: test
+  extends: .not-scheduled
+  image: python:3.11-slim
+  services:
+    - postgres:16
+  variables:
+    POSTGRES_DB: test
+    POSTGRES_PASSWORD: ci
+    TEST_DATABASE_URL: "postgresql://postgres:ci@postgres:5432/test"
+  script:
+    - cd backend
+    - pip install -r requirements-dev.txt
+    - python -m pytest -q
+
+build-api-image:
+  stage: build
+  extends: .deploy-api-rules
+  needs: [backend-tests, backend-tests-postgres]
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker login -u _json_key --password-stdin "https://$GCP_REGION-docker.pkg.dev" < "$GCP_SA_KEY"
+    - docker build -t "$IMAGE" backend
+    - docker push "$IMAGE"
+
+deploy-api:
+  stage: deploy
+  extends: .deploy-api-rules
+  needs: [build-api-image]
+  image: google/cloud-sdk:slim
+  script:
+    - gcloud auth activate-service-account --key-file="$GCP_SA_KEY" --project="$GCP_PROJECT_ID"
+    # ^##^ makes ## the separator between variables, so commas inside CORS_ORIGINS are safe.
+    # Scale-to-zero, request-based billing and a low instance cap keep the Google Cloud bill minimal.
+    - >
+      gcloud run deploy open-accounting-api
+      --image "$IMAGE" --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
+      --allow-unauthenticated --min-instances 0 --max-instances 2 --memory 512Mi
+      --set-secrets "DATABASE_URL=database-url:latest,RECURRING_RUN_TOKEN=recurring-run-token:latest"
+      --set-env-vars "^##^CORS_ORIGINS=$CORS_ORIGINS##APP_TIMEZONE=${APP_TIMEZONE:-UTC}"
+
+pages:
+  stage: deploy
+  extends: .deploy-frontend-rules
+  needs: []
+  image: node:22-alpine
+  script:
+    - cd frontend
+    - npm ci
+    - npm run build          # reads VITE_API_URL from the CI/CD variables
+    - mv dist ../public
+  artifacts:
+    paths:
+      - public
