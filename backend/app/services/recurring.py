@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 from sqlalchemy import insert, select, update
 
-from .. import db
+from .. import clock, db
 from ..models import recurring_entries as rec
 from .posting import (AccountingError, NotFound, check_amount, check_description, get_accounts, record_entry)
 
@@ -48,7 +48,7 @@ def set_active(conn, rec_id: int, active: bool, today: date | None = None) -> No
         raise NotFound(f"Recurring entry {rec_id} not found.")
     values = {"active": active}
     if active and not row.active:
-        today = today or date.today()
+        today = today or clock.today()
         next_run = row.next_run
         while next_run < today and not (row.end_date and next_run > row.end_date):
             next_run = advance(next_run, row.frequency, row.day)
@@ -62,7 +62,7 @@ def list_all(conn) -> list[dict]:
 
 def run_due(today: date | None = None) -> dict:
     """Post every occurrence that is due on or before `today`. Opens its own transactions."""
-    today = today or date.today()
+    today = today or clock.today()
     with db.engine.connect() as conn:
         ids = [r.id for r in conn.execute(select(rec.c.id).where(rec.c.active.is_(True), rec.c.next_run <= today))]
     posted, errors, truncated = [], [], False

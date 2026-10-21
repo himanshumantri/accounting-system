@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from . import db
+from . import clock, db
 from .models import accountmemos, journal
 from .services import accruals as accrual_svc
 from .services import posting, recurring, reports
@@ -27,13 +27,15 @@ RowId = Annotated[int, Field(ge=1, le=2_147_483_647)]
 
 @asynccontextmanager
 async def lifespan(_app):
+    clock.today()  # fail fast on an invalid APP_TIMEZONE
     db.init_db()
     yield
 
 
 app = FastAPI(title="Open Accounting API", lifespan=lifespan)
 
-origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+origins = [o.strip().rstrip("/") for o in os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",")
+           if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -65,7 +67,7 @@ class AccrualIn(BaseModel):
 
 
 class JournalIn(BaseModel):
-    entry_date: date = Field(default_factory=date.today)
+    entry_date: date = Field(default_factory=clock.today)
     description: str
     amount: Decimal = Amount
     debit_account: AccountNo | None = None
@@ -76,7 +78,7 @@ class JournalIn(BaseModel):
 class MemoIn(BaseModel):
     transact: RowId
     memo: str = Field(min_length=1)
-    memo_date: date = Field(default_factory=date.today)
+    memo_date: date = Field(default_factory=clock.today)
 
 
 class RecurringIn(BaseModel):
@@ -228,8 +230,8 @@ def run_recurring_now():
 @app.post("/recurring/run")
 def run_recurring_scheduled(x_run_token: str | None = Header(default=None)):
     """Called by the scheduled GitLab pipeline. Requires RECURRING_RUN_TOKEN to be set and sent."""
-    expected = os.environ.get("RECURRING_RUN_TOKEN")
-    if not expected or not secrets.compare_digest((x_run_token or "").encode(), expected.encode()):
+    expected = os.environ.get("RECURRING_RUN_TOKEN", "").strip()
+    if not expected or not secrets.compare_digest((x_run_token or "").strip().encode(), expected.encode()):
         raise HTTPException(status_code=403, detail="Invalid or missing run token.")
     return recurring.run_due()
 
