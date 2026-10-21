@@ -78,7 +78,7 @@ def _apply(conn, transact: int, debit_account: int, credit_account: int, amount:
 
 
 def record_entry(conn, *, entry_date: date, description: str, debit_account: int, credit_account: int,
-                 amount, posted: bool = True, accrual_id: int | None = None) -> int:
+                 amount, posted: bool = True, accrual_id: int | None = None, depends_on: int | None = None) -> int:
     """Validate and store one journal entry. Posted entries hit the ledger; drafts do not."""
     amount = check_amount(amount)
     description = check_description(description)
@@ -87,7 +87,8 @@ def record_entry(conn, *, entry_date: date, description: str, debit_account: int
     get_accounts(conn, [debit_account, credit_account])
     result = conn.execute(insert(journal).values(
         entry_date=entry_date, description=description, debit_account=debit_account,
-        credit_account=credit_account, amount=amount, posted=False, accrual_id=accrual_id))
+        credit_account=credit_account, amount=amount, posted=False, accrual_id=accrual_id,
+        depends_on=depends_on))
     transact = result.inserted_primary_key[0]
     if posted:
         _apply(conn, transact, debit_account, credit_account, amount)
@@ -114,17 +115,27 @@ def _get_draft(conn, transact: int):
 
 
 def post_draft(conn, transact: int) -> None:
-    """Approve a draft: post it to the ledger exactly once."""
+    """Approve a draft: post it to the ledger exactly once, and only after the entry it depends on."""
     row = _get_draft(conn, transact)
+    if row.depends_on is not None:
+        parent_posted = conn.execute(select(journal.c.posted).where(journal.c.transact == row.depends_on)).scalar_one()
+        if not parent_posted:
+            raise Conflict(f"Post entry {row.depends_on} first: entry {transact} depends on it.")
     _apply(conn, transact, row.debit_account, row.credit_account, money(row.amount))
     conn.execute(update(journal).where(journal.c.transact == transact).values(posted=True))
     _refresh_accrual_status(conn, row.accrual_id)
 
 
 def discard_draft(conn, transact: int) -> None:
+    """Delete a draft and any drafts that depend on it (they could never be posted without it)."""
     row = _get_draft(conn, transact)
+    conn.execute(delete(journal).where(journal.c.depends_on == transact, journal.c.posted.is_(False)))
     conn.execute(delete(journal).where(journal.c.transact == transact))
     _refresh_accrual_status(conn, row.accrual_id)
+
+
+def _account_exists(conn, account: int) -> bool:
+    return conn.execute(select(chart.c.account).where(chart.c.account == account)).first() is not None
 
 
 def add_account(conn, *, account: int, name: str, acct_type: str) -> None:
@@ -138,6 +149,6 @@ def add_account(conn, *, account: int, name: str, acct_type: str) -> None:
         raise AccountingError("Name is required (60 characters maximum).")
     if acct_type not in ("DEBIT", "CREDIT"):
         raise AccountingError("Type must be DEBIT or CREDIT.")
-    if conn.execute(select(chart.c.account).where(chart.c.account == account)).first():
+    if _account_exists(conn, account):
         raise Conflict(f"Account {account} already exists.")
     conn.execute(insert(chart).values(account=account, name=name, type=acct_type, balance=0))

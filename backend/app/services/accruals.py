@@ -14,7 +14,7 @@ chart balances until the user approves it (posting.post_draft).
 """
 import calendar
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from sqlalchemy import delete, insert, select, update
 
@@ -37,8 +37,12 @@ def _add_months(d: date, n: int) -> tuple[int, int]:
 
 
 def split_evenly(amount: Decimal, months: int) -> list[Decimal]:
-    """Equal monthly amounts to the cent; the last month absorbs any rounding remainder."""
-    base = (amount / months).quantize(CENT)
+    """Equal monthly amounts rounded down to the cent; the last month absorbs the remainder (always
+    zero or positive, and less than one cent per month), so the parts sum to the amount exactly."""
+    base = (amount / months).quantize(CENT, ROUND_DOWN)
+    if base < CENT:
+        raise AccountingError(
+            f"{amount} is too small to spread over {months} months (at least 0.01 per month is needed).")
     parts = [base] * (months - 1)
     parts.append(amount - sum(parts, Decimal("0.00")))
     return parts
@@ -95,7 +99,8 @@ def create_accrual(conn, *, type: str, description: str, amount, entry_date: dat
             _require_category(conn, credit_account, "liability", "Deferred revenue")
             _require_category(conn, recognition_account, "revenue", "Recognition")
             drafts_debit, drafts_credit = credit_account, recognition_account
-        for i, part in enumerate(split_evenly(amount, months)):
+        parts = split_evenly(amount, months)
+        for i, part in enumerate(parts):
             year, month = _add_months(entry_date, i)
             drafts.append((month_end(year, month), drafts_debit, drafts_credit, part,
                            f"{description} ({i + 1}/{months})"))
@@ -112,10 +117,15 @@ def create_accrual(conn, *, type: str, description: str, amount, entry_date: dat
                                        amount=amount, posted=False, accrual_id=accrual_id)
         conn.execute(update(accruals).where(accruals.c.id == accrual_id).values(source_transact=source_transact))
 
+    # Reversals wait for their original; monthly entries wait for the prepaid/deferred entry.
     draft_ids = [source_transact] if source_transact else []
-    for d, dr, cr, amt, text in drafts:
-        draft_ids.append(record_entry(conn, entry_date=d, description=text, debit_account=dr,
-                                      credit_account=cr, amount=amt, posted=False, accrual_id=accrual_id))
+    parent = source_transact
+    for i, (d, dr, cr, amt, text) in enumerate(drafts):
+        transact = record_entry(conn, entry_date=d, description=text, debit_account=dr, credit_account=cr,
+                                amount=amt, posted=False, accrual_id=accrual_id, depends_on=parent)
+        draft_ids.append(transact)
+        if type in ("accrued_expense", "accrued_revenue") and i == 0:
+            parent = transact
     return {"accrual_id": accrual_id, "source_transact": source_transact, "draft_transacts": draft_ids}
 
 
@@ -126,7 +136,8 @@ def list_drafts(conn) -> list[dict]:
         .where(journal.c.posted.is_(False)).order_by(journal.c.entry_date, journal.c.transact))
     return [{"transact": r.transact, "date": r.entry_date, "description": r.description,
              "debit_account": r.debit_account, "credit_account": r.credit_account,
-             "amount": r.amount, "accrual_id": r.accrual_id, "accrual_type": r.accrual_type} for r in rows]
+             "amount": r.amount, "accrual_id": r.accrual_id, "accrual_type": r.accrual_type,
+             "depends_on": r.depends_on} for r in rows]
 
 
 def discard_accrual(conn, accrual_id: int) -> int:

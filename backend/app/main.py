@@ -1,15 +1,17 @@
 """FastAPI app: thin HTTP layer over the services."""
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import Body, FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from . import db
 from .models import accountmemos, journal
@@ -18,6 +20,9 @@ from .services import posting, recurring, reports
 from .services.posting import AccountingError, NotFound
 
 Amount = Field(gt=0, max_digits=14, decimal_places=2)
+# Bounds keep absurd values from reaching the database (Postgres integers are 32-bit).
+AccountNo = Annotated[int, Field(ge=1, le=9999)]
+RowId = Annotated[int, Field(ge=1, le=2_147_483_647)]
 
 
 @asynccontextmanager
@@ -37,17 +42,23 @@ async def accounting_error_handler(_request, exc: AccountingError):
     return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
 
 
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(_request, _exc: IntegrityError):
+    # e.g. two requests creating the same account at the same moment
+    return JSONResponse(status_code=409, content={"detail": "That conflicts with existing data. Please retry."})
+
+
 # ---------------------------------------------------------------- schemas
 
 class AccountIn(BaseModel):
-    account: int
+    account: AccountNo
     name: str
     type: Literal["DEBIT", "CREDIT"]
 
 
 class AccrualIn(BaseModel):
     type: Literal["accrued_expense", "accrued_revenue", "prepaid_expense", "deferred_revenue"]
-    recognition_account: int | None = None
+    recognition_account: AccountNo | None = None
     period_end: date | None = None
     months: int | None = None
     auto_reverse: bool = False
@@ -57,21 +68,21 @@ class JournalIn(BaseModel):
     entry_date: date = Field(default_factory=date.today)
     description: str
     amount: Decimal = Amount
-    debit_account: int | None = None
-    credit_account: int | None = None
+    debit_account: AccountNo | None = None
+    credit_account: AccountNo | None = None
     accrual: AccrualIn | None = None
 
 
 class MemoIn(BaseModel):
-    transact: int
+    transact: RowId
     memo: str = Field(min_length=1)
     memo_date: date = Field(default_factory=date.today)
 
 
 class RecurringIn(BaseModel):
     description: str
-    debit_account: int
-    credit_account: int
+    debit_account: AccountNo
+    credit_account: AccountNo
     amount: Decimal = Amount
     frequency: Literal["weekly", "monthly"]
     first_run: date
@@ -79,7 +90,7 @@ class RecurringIn(BaseModel):
 
 
 class PostSelectedIn(BaseModel):
-    transacts: list[int] = Field(min_length=1)
+    transacts: list[RowId] = Field(min_length=1, max_length=500)
 
 
 # ---------------------------------------------------------------- routes
@@ -106,8 +117,9 @@ def add_chart_account(body: AccountIn):
 
 @app.get("/journal")
 def get_journal(status: Literal["all", "posted", "draft"] = "all", start: date | None = None,
-                end: date | None = None):
-    stmt = select(journal).order_by(journal.c.entry_date.desc(), journal.c.transact.desc())
+                end: date | None = None, limit: Annotated[int, Query(ge=1, le=2000)] = 500):
+    """Newest first, at most `limit` entries."""
+    stmt = select(journal).order_by(journal.c.entry_date.desc(), journal.c.transact.desc()).limit(limit)
     if status != "all":
         stmt = stmt.where(journal.c.posted.is_(status == "posted"))
     if start:
@@ -138,14 +150,16 @@ def add_journal_entry(body: JournalIn):
 
 
 @app.get("/ledger/{account}")
-def get_ledger(account: int):
+def get_ledger(account: Annotated[int, Path(ge=1, le=9999)]):
     with db.engine.connect() as conn:
         return reports.ledger_account(conn, account)
 
 
 @app.get("/memos")
-def get_memos(transact: int | None = None):
-    stmt = select(accountmemos).order_by(accountmemos.c.memo_date.desc(), accountmemos.c.memo_id.desc())
+def get_memos(transact: Annotated[int | None, Query(ge=1, le=2_147_483_647)] = None,
+              limit: Annotated[int, Query(ge=1, le=2000)] = 500):
+    stmt = (select(accountmemos).order_by(accountmemos.c.memo_date.desc(), accountmemos.c.memo_id.desc())
+            .limit(limit))
     if transact is not None:
         stmt = stmt.where(accountmemos.c.transact == transact)
     with db.engine.connect() as conn:
@@ -199,7 +213,7 @@ def add_recurring(body: RecurringIn):
 
 
 @app.post("/recurring/{rec_id}/active")
-def set_recurring_active(rec_id: int, active: bool = Body(embed=True)):
+def set_recurring_active(rec_id: Annotated[int, Path(ge=1, le=2_147_483_647)], active: bool = Body(embed=True)):
     with db.engine.begin() as conn:
         recurring.set_active(conn, rec_id, active)
     return {"id": rec_id, "active": active}
@@ -215,7 +229,7 @@ def run_recurring_now():
 def run_recurring_scheduled(x_run_token: str | None = Header(default=None)):
     """Called by the scheduled GitLab pipeline. Requires RECURRING_RUN_TOKEN to be set and sent."""
     expected = os.environ.get("RECURRING_RUN_TOKEN")
-    if not expected or x_run_token != expected:
+    if not expected or not secrets.compare_digest((x_run_token or "").encode(), expected.encode()):
         raise HTTPException(status_code=403, detail="Invalid or missing run token.")
     return recurring.run_due()
 
@@ -229,7 +243,7 @@ def get_accrual_drafts():
 
 
 @app.post("/accruals/drafts/{transact}/post")
-def post_accrual_draft(transact: int):
+def post_accrual_draft(transact: Annotated[int, Path(ge=1, le=2_147_483_647)]):
     with db.engine.begin() as conn:
         posting.post_draft(conn, transact)
     return {"transact": transact, "posted": True}
@@ -245,14 +259,14 @@ def post_selected_drafts(body: PostSelectedIn):
 
 
 @app.delete("/accruals/drafts/{transact}")
-def discard_accrual_draft(transact: int):
+def discard_accrual_draft(transact: Annotated[int, Path(ge=1, le=2_147_483_647)]):
     with db.engine.begin() as conn:
         posting.discard_draft(conn, transact)
     return {"transact": transact, "discarded": True}
 
 
 @app.delete("/accruals/{accrual_id}")
-def discard_accrual(accrual_id: int):
+def discard_accrual(accrual_id: Annotated[int, Path(ge=1, le=2_147_483_647)]):
     with db.engine.begin() as conn:
         count = accrual_svc.discard_accrual(conn, accrual_id)
     return {"accrual_id": accrual_id, "discarded_drafts": count}

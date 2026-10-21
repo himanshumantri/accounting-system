@@ -18,7 +18,9 @@ backend-tests:
 
 run-recurring:
   stage: schedule
-  image: curlimages/curl:8.11.1
+  image:
+    name: curlimages/curl:8.11.1
+    entrypoint: [""]   # the image's default entrypoint is `curl`, which GitLab's runner cannot run a script under
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
   script:
