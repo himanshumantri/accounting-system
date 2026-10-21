@@ -16,3 +16,4 @@ frontend/dist/
 
 # Editors
 .vs/
+!.env.example
