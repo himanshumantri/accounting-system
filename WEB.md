@@ -32,10 +32,11 @@ on start but never altered, so delete any old local `openaccounting.db` after pu
 | API | Google Cloud Run | Scales to zero; the first request after idle is slow. |
 | API container image | Google Artifact Registry | Cloud Run can only pull images from Google's registries. A cleanup policy keeps just the last 2. |
 | Database | Neon (free Postgres) | Cloud Run connects over the internet with SSL. |
-| Secrets and settings | GitLab CI/CD variables | Passed to Cloud Run as environment variables at deploy time. |
+| Secrets | Google Secret Manager | `database-url` and `recurring-run-token`. Cloud Run reads them directly; GitLab never sees them. |
+| Other settings | GitLab CI/CD variables | Non-secret values such as the site URL. Passed to Cloud Run at deploy time. |
 
-Not used, so they cannot add cost: Cloud Build, Secret Manager, Cloud Scheduler, Firebase. Only two Google APIs
-are enabled (Cloud Run and Artifact Registry). Replace `PROJECT_ID`, `REGION` (e.g. `asia-south1`) and the other
+Not used, so they cannot add cost: Cloud Build, Cloud Scheduler, Firebase. Only three Google APIs are enabled
+(Cloud Run, Artifact Registry and Secret Manager). Replace `PROJECT_ID`, `REGION` (e.g. `asia-south1`) and the other
 capitalised placeholders. You need the [gcloud CLI](https://cloud.google.com/sdk/docs/install) and a Google Cloud
 project with billing enabled (the free allowances still need a billing account). Check current pricing yourself.
 
@@ -47,7 +48,7 @@ host contains `-pooler` and it ends in `?sslmode=require`. Tables are created au
 ```
 gcloud auth login
 gcloud config set project PROJECT_ID
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
 gcloud artifacts repositories create open-accounting --repository-format=docker --location=REGION
 gcloud artifacts repositories set-cleanup-policies open-accounting --location=REGION --policy=deploy/artifact-registry-cleanup.json --no-dry-run
 ```
@@ -66,6 +67,18 @@ password: paste its contents into GitLab in the next step, then delete `sa-key.j
 leave it around). If your organisation blocks key creation, use Workload Identity Federation with GitLab's OIDC
 tokens instead.
 
+Store the two secrets. Put the Neon connection string alone in a text file (`neon-url.txt`) and a random token in
+another (`token.txt`; `python -c "import secrets; print(secrets.token_urlsafe(32))"` generates one). A trailing
+newline in the files is fine. Then:
+```
+gcloud secrets create database-url --data-file=neon-url.txt
+gcloud secrets create recurring-run-token --data-file=token.txt
+gcloud secrets add-iam-policy-binding database-url --member "serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" --role roles/secretmanager.secretAccessor
+gcloud secrets add-iam-policy-binding recurring-run-token --member "serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" --role roles/secretmanager.secretAccessor
+```
+Delete both text files afterwards (they are git-ignored). `PROJECT_NUMBER-compute@...` is the identity Cloud Run runs
+as, and it is the one that needs access to the secrets; the GitLab deploy account does not need to read them.
+
 ### 3. GitLab: variables and Pages
 Push this repository to a GitLab project, then add these under **Settings > CI/CD > Variables**:
 
@@ -74,14 +87,13 @@ Push this repository to a GitLab project, then add these under **Settings > CI/C
 | `GCP_PROJECT_ID` | Variable | your project id |
 | `GCP_REGION` | Variable | the region used above |
 | `GCP_SA_KEY` | **File** | contents of `sa-key.json` |
-| `DATABASE_URL` | Variable, masked + protected | the Neon pooled connection string |
 | `CORS_ORIGINS` | Variable | the Pages origin (step 4) |
 | `VITE_API_URL` | Variable | the Cloud Run URL (step 4) |
-| `RECURRING_RUN_TOKEN` | Variable, masked + protected | optional: a long random string that enables `POST /recurring/run` |
 | `APP_TIMEZONE` | Variable | optional, e.g. `Asia/Kolkata`; what "today" means for recurring entries (default UTC) |
 
-"Protected" variables are only available to protected branches, and the default branch is protected by default.
-Turn on Pages for the project if your GitLab plan asks (**Deploy > Pages**).
+The database URL and run token are not GitLab variables; they come from Secret Manager (step 2).
+`GCP_SA_KEY` can be marked protected: protected variables are only available to protected branches, and the default
+branch is protected by default. Turn on Pages for the project if your GitLab plan asks (**Deploy > Pages**).
 
 ### 4. First deploy
 The Cloud Run URL and Pages URL are only known after the first run, so deploy twice:
@@ -100,13 +112,32 @@ the API; `frontend/` changes republish the site. Other changes (docs, tests-only
 - Cloud Run is set to scale to zero (`--min-instances 0`), 512 MiB, at most 2 instances, billed per request.
 - Artifact Registry's cleanup policy keeps only the 2 newest images (the first 0.5 GB of storage is free).
 - Set a budget alert (**Billing > Budgets & alerts**) at a small amount. Budgets send email but do not stop spending.
-- Cloud Run settings are visible to anyone with access to your Google Cloud project, including `DATABASE_URL`.
-  If other people get project access, move the secrets to Secret Manager (which has a small free tier).
+- Secret Manager's free tier is 6 active secret versions, 10,000 accesses and 3 rotations per month, counted across
+  **all projects on the same billing account**. This app uses 2 versions and about 2 accesses per cold start. If
+  your other projects already use 4 or more versions, each extra one costs about $0.06 a month. Disabled versions
+  count as active; destroyed ones are free. Verify on the [pricing page](https://cloud.google.com/secret-manager/pricing).
+
+### Changing a secret
+```
+gcloud secrets versions add database-url --data-file=neon-url.txt
+gcloud secrets versions list database-url
+gcloud secrets versions destroy OLD_VERSION_NUMBER --secret database-url
+gcloud run services update open-accounting-api --region REGION --update-env-vars SECRETS_ROTATED=2026-10-21
+```
+The last command only forces a new revision (put today's date, a different value each time): Cloud Run reads the `latest` version when an instance starts, so
+running instances keep the old value until replaced. Destroy the old version so it stops counting as active.
+
+### Who can see the secrets
+Cloud Run settings and Secret Manager are per Google Cloud project. Other projects cannot read this project's
+secrets or service settings, and nothing here grants them access. What matters is who has a role in **this**
+project (or on a folder or organisation above it): the `Secret Accessor` role is needed to read a secret's value, and
+Viewer-style roles can see the service configuration but not the secret values. Keep this app in its own project.
 
 ### Recurring entries
 Entries post when someone presses **Run due now** on the Recurring tab. To make it automatic, schedule a call
 yourself (for example a GitLab pipeline schedule with its own job; pipelines started by a schedule skip all the
-deploy jobs here): `POST API_URL/recurring/run` with the header `X-Run-Token: <RECURRING_RUN_TOKEN>`. It is safe to
+deploy jobs here): `POST API_URL/recurring/run` with the header `X-Run-Token: <the value of the recurring-run-token
+secret>` (store that value as a masked GitLab variable for your schedule job). It is safe to
 call repeatedly: running twice never double-posts and missed periods are caught up.
 
 ### Notes

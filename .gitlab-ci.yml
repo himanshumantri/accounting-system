@@ -8,11 +8,12 @@
 # Set these under Settings > CI/CD > Variables (see WEB.md for how to get each value):
 #   GCP_PROJECT_ID, GCP_REGION   plain variables
 #   GCP_SA_KEY                   type "File": the deploy service account's JSON key
-#   DATABASE_URL                 masked + protected: the Neon connection string
-#   RECURRING_RUN_TOKEN          masked + protected: any long random string (optional; enables POST /recurring/run)
 #   CORS_ORIGINS                 the Pages site origin, e.g. https://my-project-1a2b3c.gitlab.io
 #   VITE_API_URL                 the Cloud Run service URL (known after the first deploy)
 #   APP_TIMEZONE                 optional, e.g. Asia/Kolkata (default UTC)
+#
+# The two real secrets, DATABASE_URL and RECURRING_RUN_TOKEN, are NOT GitLab variables: they live in Google
+# Secret Manager (secrets "database-url" and "recurring-run-token") and Cloud Run reads them directly.
 #
 # Pipelines started by a schedule skip every job here, so any schedule you add will not rebuild or redeploy.
 
@@ -88,13 +89,14 @@ deploy-api:
   image: google/cloud-sdk:slim
   script:
     - gcloud auth activate-service-account --key-file="$GCP_SA_KEY" --project="$GCP_PROJECT_ID"
-    # ^##^ makes ## the separator between variables, so commas and @ inside values are safe.
+    # ^##^ makes ## the separator between variables, so commas inside CORS_ORIGINS are safe.
     # Scale-to-zero, request-based billing and a low instance cap keep the Google Cloud bill minimal.
     - >
       gcloud run deploy open-accounting-api
       --image "$IMAGE" --region "$GCP_REGION" --project "$GCP_PROJECT_ID"
       --allow-unauthenticated --min-instances 0 --max-instances 2 --memory 512Mi
-      --set-env-vars "^##^DATABASE_URL=$DATABASE_URL##CORS_ORIGINS=$CORS_ORIGINS##RECURRING_RUN_TOKEN=${RECURRING_RUN_TOKEN:-}##APP_TIMEZONE=${APP_TIMEZONE:-UTC}"
+      --set-secrets "DATABASE_URL=database-url:latest,RECURRING_RUN_TOKEN=recurring-run-token:latest"
+      --set-env-vars "^##^CORS_ORIGINS=$CORS_ORIGINS##APP_TIMEZONE=${APP_TIMEZONE:-UTC}"
 
 pages:
   stage: deploy
