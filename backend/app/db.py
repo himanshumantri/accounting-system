@@ -12,7 +12,9 @@ warnings.filterwarnings("ignore", message=".*does \\*not\\* support Decimal.*", 
 
 
 def normalize_url(url: str) -> str:
-    """Render/Neon hand out postgres:// or postgresql:// URLs; point them at the psycopg 3 driver."""
+    """Neon hands out postgres:// or postgresql:// URLs; point them at the psycopg 3 driver.
+    Whitespace is stripped because secrets pasted into a console or file often carry a trailing newline."""
+    url = url.strip()
     for prefix in ("postgres://", "postgresql://"):
         if url.startswith(prefix):
             return "postgresql+psycopg://" + url[len(prefix):]
@@ -28,7 +30,15 @@ def make_engine(url: str | None = None):
         def _enable_fk(dbapi_conn, _record):
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
     else:
-        eng = create_engine(url, pool_pre_ping=True)
+        eng = create_engine(
+            url,
+            pool_pre_ping=True,   # Neon closes idle connections when its compute scales to zero
+            pool_recycle=300,
+            pool_size=5,
+            max_overflow=5,       # Cloud Run runs several instances; keep each one's share small
+            # Neon's pooled endpoint (PgBouncer) does not support server-side prepared statements.
+            connect_args={"prepare_threshold": None},
+        )
     return eng
 
 

@@ -17,3 +17,9 @@ frontend/dist/
 # Editors
 .vs/
 !.env.example
+
+# Firebase / deploy helper files (never commit secrets)
+.firebase/
+firebase-debug.log
+neon-url.txt
+token.txt
