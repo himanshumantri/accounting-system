@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local databases and secrets (the demo .db in git history is the legacy desktop sample)
+openaccounting.db
+backend/*.db
+.env
+.env.*
+
+# Node / build
+node_modules/
+frontend/dist/
+
+# Editors
+.vs/
+!.env.example
