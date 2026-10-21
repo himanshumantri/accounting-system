@@ -10,7 +10,7 @@ function Block({ title, rows, total, totalLabel }) {
         <thead><tr><th>Account</th><th>Name</th><th className="num">Balance</th></tr></thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={r.account}><td>{r.account}</td><td>{r.name}</td><td className="num">{fmt(r.balance)}</td></tr>
+            <tr key={r.account}><td>{r.account}</td><td>{r.name} {r.contra && <span className="badge">contra</span>}</td><td className="num">{fmt(r.balance)}</td></tr>
           ))}
           <tr className="total"><td colSpan="2">{totalLabel || 'Total'}</td><td className="num">{fmt(total)}</td></tr>
         </tbody>

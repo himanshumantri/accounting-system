@@ -39,7 +39,8 @@ export default function Recurring({ chart }) {
     setError(''); setOk('');
     try {
       const res = await api.post('/recurring/run-now');
-      setOk(`Posted ${res.posted.length} entr${res.posted.length === 1 ? 'y' : 'ies'}.`);
+      setOk(`Posted ${res.posted.length} entr${res.posted.length === 1 ? 'y' : 'ies'}.`
+        + (res.truncated ? ' More are still due: press Run due now again.' : ''));
       if (res.errors.length) setError(res.errors.map((x) => `#${x.recurring_id}: ${x.error}`).join('; '));
       load();
     } catch (err) { setError(err.message); }

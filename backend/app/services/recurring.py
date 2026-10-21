@@ -10,6 +10,7 @@ from ..models import recurring_entries as rec
 from .posting import (AccountingError, NotFound, check_amount, check_description, get_accounts, record_entry)
 
 FREQUENCIES = ("weekly", "monthly")
+MAX_PER_RUN = 400  # per entry; a very old start date is worked off over several runs, not one huge request
 
 
 def _clamp_day(year: int, month: int, day: int) -> date:
@@ -40,9 +41,19 @@ def create(conn, *, description: str, debit_account: int, credit_account: int, a
         next_run=first_run, end_date=end_date, active=True)).inserted_primary_key[0]
 
 
-def set_active(conn, rec_id: int, active: bool) -> None:
-    if conn.execute(update(rec).where(rec.c.id == rec_id).values(active=active)).rowcount == 0:
+def set_active(conn, rec_id: int, active: bool, today: date | None = None) -> None:
+    """Pause or resume. Resuming skips the periods that fell while paused (they are not back-posted)."""
+    row = conn.execute(select(rec).where(rec.c.id == rec_id).with_for_update()).first()
+    if row is None:
         raise NotFound(f"Recurring entry {rec_id} not found.")
+    values = {"active": active}
+    if active and not row.active:
+        today = today or date.today()
+        next_run = row.next_run
+        while next_run < today and not (row.end_date and next_run > row.end_date):
+            next_run = advance(next_run, row.frequency, row.day)
+        values["next_run"] = next_run
+    conn.execute(update(rec).where(rec.c.id == rec_id).values(**values))
 
 
 def list_all(conn) -> list[dict]:
@@ -54,9 +65,13 @@ def run_due(today: date | None = None) -> dict:
     today = today or date.today()
     with db.engine.connect() as conn:
         ids = [r.id for r in conn.execute(select(rec.c.id).where(rec.c.active.is_(True), rec.c.next_run <= today))]
-    posted, errors = [], []
+    posted, errors, truncated = [], [], False
     for rec_id in ids:
+        count = 0
         while True:
+            if count >= MAX_PER_RUN:
+                truncated = True
+                break
             try:
                 with db.engine.begin() as conn:  # one occurrence per transaction
                     row = conn.execute(select(rec).where(rec.c.id == rec_id).with_for_update()).first()
@@ -71,7 +86,8 @@ def run_due(today: date | None = None) -> dict:
                     conn.execute(update(rec).where(rec.c.id == rec_id)
                                  .values(next_run=advance(row.next_run, row.frequency, row.day)))
                     posted.append({"recurring_id": rec_id, "transact": transact, "date": row.next_run})
+                    count += 1
             except AccountingError as exc:
                 errors.append({"recurring_id": rec_id, "error": str(exc)})
                 break
-    return {"posted": posted, "errors": errors}
+    return {"posted": posted, "errors": errors, "truncated": truncated}

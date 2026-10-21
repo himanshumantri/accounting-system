@@ -49,6 +49,9 @@ journal = Table(
     Column("amount", Money, nullable=False),
     Column("posted", Boolean, nullable=False, default=False),
     Column("accrual_id", Integer, ForeignKey("accruals.id")),
+    # A draft that may only be posted after another entry (a reversal after its original,
+    # monthly amortization after the prepaid/deferred entry).
+    Column("depends_on", Integer, ForeignKey("journal.transact")),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     CheckConstraint("amount > 0", name="ck_journal_amount_positive"),
     CheckConstraint("debit_account <> credit_account", name="ck_journal_distinct_accounts"),

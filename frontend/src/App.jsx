@@ -27,7 +27,8 @@ export default function App() {
     () => api.get('/chart').then(setChart).catch((e) => setError(e.message)),
     [],
   );
-  useEffect(() => { reloadChart(); }, [reloadChart]);
+  // Balances change whenever entries are posted, so refresh the chart each time the user switches tabs.
+  useEffect(() => { reloadChart(); }, [reloadChart, tab]);
 
   const Page = TABS.find(([id]) => id === tab)[2];
   return (

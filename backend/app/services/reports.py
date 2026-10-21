@@ -39,8 +39,25 @@ def account_balances(conn) -> list[dict]:
              "chart_balance": money(r.balance), "balance": money(r.total)} for r in conn.execute(stmt)]
 
 
+# The side on which each statement section normally increases.
+NORMAL_SIDE = {"asset": "DEBIT", "expense": "DEBIT", "liability": "CREDIT", "equity": "CREDIT", "revenue": "CREDIT"}
+
+
 def _total(rows) -> Decimal:
     return sum((r["balance"] for r in rows), ZERO)
+
+
+def _section(rows, cat: str) -> list[dict]:
+    """Rows of one statement section. An account on the opposite side to the section's normal side
+    (accumulated depreciation among assets, drawings among equity, sales returns among revenue) is a
+    contra account: its balance counts negatively, so section totals subtract it."""
+    normal = NORMAL_SIDE[cat]
+    out = []
+    for r in rows:
+        if category(r["account"]) == cat:
+            contra = r["type"] != normal
+            out.append({**r, "balance": -r["balance"] if contra else r["balance"], "contra": contra})
+    return out
 
 
 def list_chart(conn) -> list[dict]:
@@ -78,8 +95,7 @@ def trial_balance(conn) -> dict:
 
 def income_statement(conn) -> dict:
     rows = account_balances(conn)
-    revenue = [r for r in rows if category(r["account"]) == "revenue"]
-    expenses = [r for r in rows if category(r["account"]) == "expense"]
+    revenue, expenses = _section(rows, "revenue"), _section(rows, "expense")
     total_revenue, total_expenses = _total(revenue), _total(expenses)
     return {"revenue": revenue, "expenses": expenses, "total_revenue": total_revenue,
             "total_expenses": total_expenses, "net_income": total_revenue - total_expenses}
@@ -90,11 +106,11 @@ def balance_sheet(conn) -> dict:
     current-period net income (revenue - expenses)."""
     rows = account_balances(conn)
     income = income_statement(conn)
-    assets = [r for r in rows if category(r["account"]) == "asset"]
-    liabilities = [r for r in rows if category(r["account"]) == "liability"]
-    equity = [r for r in rows if category(r["account"]) == "equity" and r["account"] != 399]
-    booked = next((r["balance"] for r in rows if r["account"] == 399), ZERO)
-    retained = {"account": 399, "name": "RETAINED EARNINGS", "type": "CREDIT",
+    assets, liabilities = _section(rows, "asset"), _section(rows, "liability")
+    equity_all = _section(rows, "equity")
+    equity = [r for r in equity_all if r["account"] != 399]
+    booked = next((r["balance"] for r in equity_all if r["account"] == 399), ZERO)
+    retained = {"account": 399, "name": "RETAINED EARNINGS", "type": "CREDIT", "contra": False,
                 "balance": booked + income["net_income"]}
     total_assets, total_liabilities = _total(assets), _total(liabilities)
     total_equity = _total(equity) + retained["balance"]
