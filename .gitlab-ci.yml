@@ -1,0 +1,28 @@
+# Runs the backend tests on every push. A daily scheduled pipeline also posts due recurring entries.
+# Set these in GitLab > Settings > CI/CD > Variables (masked):
+#   API_URL               e.g. https://open-accounting-api.onrender.com
+#   RECURRING_RUN_TOKEN   same value as the Render env var
+# Then add a schedule under Build > Pipeline schedules (daily).
+
+stages: [test, schedule]
+
+backend-tests:
+  stage: test
+  image: python:3.11-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+  script:
+    - cd backend
+    - pip install -r requirements-dev.txt
+    - python -m pytest -q
+
+run-recurring:
+  stage: schedule
+  image: curlimages/curl:8.11.1
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    # --retry covers Render's cold start on the free tier
+    - >
+      curl --fail-with-body --silent --show-error --retry 5 --retry-delay 20 --retry-all-errors
+      --max-time 120 -X POST -H "X-Run-Token: $RECURRING_RUN_TOKEN" "$API_URL/recurring/run"
